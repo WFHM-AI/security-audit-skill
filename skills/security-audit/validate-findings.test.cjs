@@ -15,10 +15,11 @@ const {
 const validatorPath = path.join(__dirname, "validate-findings.cjs");
 const CLI_TIMEOUT_MS = 5000;
 const HOSTILE_CLI_TIMEOUT_MS = 15000;
-const HAS_SAFE_INPUT_OPEN = Number.isInteger(fs.constants.O_NOFOLLOW) &&
+// POSIX uses O_NOFOLLOW | O_NONBLOCK; Windows uses the validators' lstat + same-file check.
+const HAS_SAFE_INPUT_OPEN = process.platform === "win32" || (Number.isInteger(fs.constants.O_NOFOLLOW) &&
   fs.constants.O_NOFOLLOW !== 0 &&
   Number.isInteger(fs.constants.O_NONBLOCK) &&
-  fs.constants.O_NONBLOCK !== 0;
+  fs.constants.O_NONBLOCK !== 0);
 const TERMINAL_CONTROL_PAYLOAD = "\u001b\u0007\u0085\u202e\u034f\ufe0f";
 const TERMINAL_CONTROL_BYTES = [
   Buffer.from([0x1b]),
@@ -483,13 +484,21 @@ test("CLI rejects a FIFO without blocking", { skip: process.platform === "win32"
   }
 });
 
-test("CLI rejects a symlink without following it", { skip: process.platform === "win32" || !HAS_SAFE_INPUT_OPEN }, () => {
+test("CLI rejects a symlink without following it", { skip: !HAS_SAFE_INPUT_OPEN }, (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-symlink-"));
   const targetPath = path.join(directory, "target.json");
   const symlinkPath = path.join(directory, "findings.json");
   try {
     fs.writeFileSync(targetPath, JSON.stringify(producerShapedFindings()));
-    fs.symlinkSync(targetPath, symlinkPath);
+    try {
+      fs.symlinkSync(targetPath, symlinkPath);
+    } catch (error) {
+      if (process.platform === "win32" && error && error.code === "EPERM") {
+        t.skip("creating symlinks on Windows needs Developer Mode or administrator rights");
+        return;
+      }
+      throw error;
+    }
     const result = spawnSync(process.execPath, [validatorPath, symlinkPath], {
       encoding: "utf8",
       timeout: CLI_TIMEOUT_MS,
@@ -648,5 +657,15 @@ test("keeps shared helpers aligned with the coverage-ledger validator", () => {
       ledgerModule.hasVisibleProse(value),
       `prose verdict diverges for ${JSON.stringify(value)}`,
     );
+  }
+});
+
+test("CLI refuses Windows device and pipe paths", { skip: process.platform !== "win32" }, () => {
+  for (const devicePath of ["\\\\.\\NUL", "\\\\.\\pipe\\zone-validator-test", "\\\\?\\GLOBALROOT\\Device\\Null"]) {
+    const result = spawnSync(process.execPath, [validatorPath, devicePath], { encoding: "utf8", timeout: CLI_TIMEOUT_MS });
+    const output = cliOutput(result);
+    assert.notEqual(result.error && result.error.code, "ETIMEDOUT", output);
+    assert.equal(result.status, 1, output);
+    assert.match(output, /device or pipe path/);
   }
 });

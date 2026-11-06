@@ -17,10 +17,11 @@ const {
 const validatorPath = path.join(__dirname, "validate-coverage-ledger.cjs");
 const CLI_TIMEOUT_MS = 5000;
 const HOSTILE_CLI_TIMEOUT_MS = 15000;
-const HAS_SAFE_INPUT_OPEN = Number.isInteger(fs.constants.O_NOFOLLOW) &&
+// POSIX uses O_NOFOLLOW | O_NONBLOCK; Windows uses the validators' lstat + same-file check.
+const HAS_SAFE_INPUT_OPEN = process.platform === "win32" || (Number.isInteger(fs.constants.O_NOFOLLOW) &&
   fs.constants.O_NOFOLLOW !== 0 &&
   Number.isInteger(fs.constants.O_NONBLOCK) &&
-  fs.constants.O_NONBLOCK !== 0;
+  fs.constants.O_NONBLOCK !== 0);
 
 function unit(overrides = {}) {
   const canonicalRefs = overrides.canonical_refs || {
@@ -644,13 +645,21 @@ test("rejects a FIFO through the CLI without blocking", { skip: process.platform
   }
 });
 
-test("rejects a symlink through the CLI", { skip: process.platform === "win32" || !HAS_SAFE_INPUT_OPEN }, () => {
+test("rejects a symlink through the CLI", { skip: !HAS_SAFE_INPUT_OPEN }, (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-symlink-"));
   const targetPath = path.join(directory, "target.json");
   const symlinkPath = path.join(directory, "coverage-ledger.json");
   try {
     fs.writeFileSync(targetPath, JSON.stringify([unit()]));
-    fs.symlinkSync(targetPath, symlinkPath);
+    try {
+      fs.symlinkSync(targetPath, symlinkPath);
+    } catch (error) {
+      if (process.platform === "win32" && error && error.code === "EPERM") {
+        t.skip("creating symlinks on Windows needs Developer Mode or administrator rights");
+        return;
+      }
+      throw error;
+    }
     const result = spawnSync(process.execPath, [validatorPath, symlinkPath], {
       encoding: "utf8",
       timeout: CLI_TIMEOUT_MS,
@@ -736,5 +745,15 @@ test("accepts a canonical ID derived from near-maximum multibyte references", ()
   if (HAS_SAFE_INPUT_OPEN) {
     const result = runCli(JSON.stringify([value]));
     assert.equal(result.status, 0, cliOutput(result));
+  }
+});
+
+test("CLI refuses Windows device and pipe paths", { skip: process.platform !== "win32" }, () => {
+  for (const devicePath of ["\\\\.\\NUL", "\\\\.\\pipe\\zone-validator-test", "\\\\?\\GLOBALROOT\\Device\\Null"]) {
+    const result = spawnSync(process.execPath, [validatorPath, devicePath], { encoding: "utf8", timeout: CLI_TIMEOUT_MS });
+    const output = cliOutput(result);
+    assert.notEqual(result.error && result.error.code, "ETIMEDOUT", output);
+    assert.equal(result.status, 1, output);
+    assert.match(output, /device or pipe path/);
   }
 });

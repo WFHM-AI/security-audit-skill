@@ -718,21 +718,48 @@ function collectUnitErrors(unit, index) {
   return errors;
 }
 
-function readFileWithinLimit(file) {
+// Opens the input without following a final-component link and without blocking on a pipe.
+// POSIX: O_NOFOLLOW | O_NONBLOCK. Windows (Node exposes neither flag): refuse device and pipe
+// namespaces, lstat the path (rejecting links and non-regular files), open it, then require the
+// opened descriptor to be that same file (volume and file ID), so a swap between the check and
+// the open is rejected instead of followed. Any check that cannot be made rejects the input.
+function openInputDescriptor(file) {
   const noFollow = fs.constants.O_NOFOLLOW;
   const nonBlock = fs.constants.O_NONBLOCK;
-  if (!Number.isInteger(noFollow) || noFollow === 0 || !Number.isInteger(nonBlock) || nonBlock === 0) {
-    // Node exposes no race-safe fallback on these platforms, so reject all inputs.
+  if (Number.isInteger(noFollow) && noFollow !== 0 && Number.isInteger(nonBlock) && nonBlock !== 0) {
+    try {
+      return fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    } catch (error) {
+      if (error && (error.code === "ELOOP" || error.code === "EMLINK")) throw new SafeInputError("input must not be a symlink");
+      throw error;
+    }
+  }
+  if (process.platform !== "win32") {
     throw new SafeInputError("OS no-follow and nonblocking input protection is unavailable");
   }
 
-  let descriptor;
+  const resolved = path.resolve(file);
+  if (/^[\\/]{2}[.?][\\/]/.test(resolved)) throw new SafeInputError("input must be a regular file, not a device or pipe path");
+  const checked = fs.lstatSync(resolved, { bigint: true });
+  if (checked.isSymbolicLink()) throw new SafeInputError("input must not be a symlink");
+  if (!checked.isFile()) throw new SafeInputError("input must be a regular file");
+  if (checked.ino === 0n) throw new SafeInputError("input file identity cannot be verified on this volume");
+
+  const descriptor = fs.openSync(resolved, fs.constants.O_RDONLY);
   try {
-    descriptor = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fs.fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.dev !== checked.dev || opened.ino !== checked.ino) {
+      throw new SafeInputError("input changed while it was being opened");
+    }
   } catch (error) {
-    if (error && (error.code === "ELOOP" || error.code === "EMLINK")) throw new SafeInputError("input must not be a symlink");
+    fs.closeSync(descriptor);
     throw error;
   }
+  return descriptor;
+}
+
+function readFileWithinLimit(file) {
+  const descriptor = openInputDescriptor(file);
   try {
     const stat = fs.fstatSync(descriptor);
     if (!stat.isFile()) throw new SafeInputError("input must be a regular file");
